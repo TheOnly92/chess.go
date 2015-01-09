@@ -267,12 +267,6 @@ func (g *GameNode) Export(exporter Exporter, comments, variations bool, board *B
 		if comments && len(g.comment) > 0 {
 			exporter.PutStartingComment(g.comment)
 		}
-
-		g.Export(exporter, comments, variations, nil, false, false)
-
-		exporter.PutResult(g.Headers["Result"])
-		exporter.EndGame()
-		return
 	}
 
 	if board == nil {
@@ -301,7 +295,7 @@ func (g *GameNode) Export(exporter Exporter, comments, variations bool, board *B
 	}
 
 	// Then export sidelines.
-	if variations {
+	if variations && len(g.variations) > 1 {
 		for _, variation := range g.variations[1:] {
 			// Start variation.
 			exporter.StartVariation()
@@ -346,6 +340,13 @@ func (g *GameNode) Export(exporter Exporter, comments, variations bool, board *B
 		mainVariation.Export(exporter, comments, variations, board, variations && len(g.variations) > 1, false)
 		board.Pop()
 	}
+
+	if g.parent == nil {
+		exporter.PutResult(g.Headers["Result"])
+		exporter.EndGame()
+	}
+	return
+
 }
 
 func (g *GameNode) String() string {
@@ -517,6 +518,13 @@ func NewFileExporter(handle *os.File, columns int) *FileExporter {
 	return exporter
 }
 
+func (s *FileExporter) WriteToken(token string) {
+	if s.columns > 0 && s.columns-len(s.currentLine) < len(token) {
+		s.FlushCurrentLine()
+	}
+	s.currentLine += token
+}
+
 func (f *FileExporter) FlushCurrentLine() {
 	if f.currentLine != "" {
 		f.handle.WriteString(strings.TrimRightFunc(f.currentLine, unicode.IsSpace))
@@ -529,6 +537,72 @@ func (f *FileExporter) WriteLine(line string) {
 	f.FlushCurrentLine()
 	f.handle.WriteString(strings.TrimRightFunc(line, unicode.IsSpace))
 	f.handle.Write([]byte{'\n'})
+}
+
+func (s *FileExporter) StartGame()    {}
+func (s *FileExporter) StartHeaders() {}
+
+func (s *FileExporter) EndGame() {
+	s.WriteLine("")
+}
+
+func (s *FileExporter) PutHeader(tagname, tagvalue string) {
+	s.WriteLine(fmt.Sprintf("[%s \"%s\"]", tagname, tagvalue))
+}
+
+func (s *FileExporter) EndHeaders() {
+	s.WriteLine("")
+}
+
+func (s *FileExporter) StartVariation() {
+	s.WriteToken("( ")
+}
+
+func (s *FileExporter) EndVariation() {
+	s.WriteToken(") ")
+}
+
+func (s *FileExporter) PutStartingComment(comment string) {
+	s.PutComment(comment)
+}
+
+func (s *FileExporter) PutComment(comment string) {
+	s.WriteToken("{ " + strings.TrimSpace(strings.Replace(comment, "}", "", -1)) + " } ")
+}
+
+func (s *FileExporter) PutNags(nags []int) {
+	sort.Ints(nags)
+	for _, nag := range nags {
+		s.PutNag(nag)
+	}
+}
+
+func (s *FileExporter) PutNag(nag int) {
+	s.WriteToken("$" + strconv.Itoa(nag) + " ")
+}
+
+func (s *FileExporter) PutFullMoveNumber(turn Colors, fullMoveNumber int, variationStart bool) {
+	if turn == White {
+		s.WriteToken(strconv.Itoa(fullMoveNumber) + ". ")
+	} else if variationStart {
+		s.WriteToken(strconv.Itoa(fullMoveNumber) + "... ")
+	}
+}
+
+func (s *FileExporter) PutMove(board *Bitboard, move *Move) {
+	s.WriteToken(board.San(move) + " ")
+}
+
+func (s *FileExporter) PutResult(result string) {
+	s.WriteToken(result + " ")
+}
+
+func (s *FileExporter) File() string {
+	if len(s.currentLine) > 0 {
+		return strings.TrimRightFunc(strings.Join(append(s.lines, strings.TrimRightFunc(s.currentLine, unicode.IsSpace)), "\n"), unicode.IsSpace)
+	}
+
+	return strings.TrimRightFunc(strings.Join(s.lines, "\n"), unicode.IsSpace)
 }
 
 type PGNReader struct {
@@ -578,11 +652,19 @@ func (r *PGNReader) Next() bool {
 	foundContent := false
 
 	// Parse game headers.
-	line, _ := r.reader.ReadString('\n')
+	line, err := r.reader.ReadString('\n')
+	if err != nil {
+		r.err = err
+		return false
+	}
 	for len(line) > 0 {
 		// Skip empty lines and comments.
 		if len(strings.TrimSpace(line)) == 0 || strings.HasPrefix(strings.TrimSpace(line), "%") {
-			line, _ = r.reader.ReadString('\n')
+			line, err = r.reader.ReadString('\n')
+			if err != nil {
+				r.err = err
+				return false
+			}
 			continue
 		}
 
@@ -596,12 +678,20 @@ func (r *PGNReader) Next() bool {
 			break
 		}
 
-		line, _ = r.reader.ReadString('\n')
+		line, err = r.reader.ReadString('\n')
+		if err != nil {
+			r.err = err
+			return false
+		}
 	}
 
 	// Get the next non-empty line.
 	for len(strings.TrimSpace(line)) == 0 {
-		line, _ = r.reader.ReadString('\n')
+		line, err = r.reader.ReadString('\n')
+		if err != nil {
+			r.err = err
+			return false
+		}
 	}
 
 	// Movetext parser state.
@@ -756,6 +846,7 @@ func (r *PGNReader) Next() bool {
 				boardStack.Push(tmp)
 				move, err := tmp.ParseSan(token)
 				if err != nil {
+					fmt.Printf("'%s' %d\n", token, variationStack.Len())
 					r.game = game
 					r.err = err
 					return true
